@@ -103,12 +103,12 @@ class EmgDecompositionParams:
 
     sampling_rate: float
     extension_factor: int = 16
-    maximum_num_sources: int = 25
-    min_peaks_distance_ms: Optional[float] = 15.0
-    contrast_function: str = 'logcosh'
+    maximum_num_sources: int = 150
+    min_peaks_distance_ms: Optional[float] = 5
+    contrast_function: str = 'cube'
     max_iter: int = 100
     convergence_tolerance: float = 1e-4
-    sil_threshold: float = 0.85
+    sil_threshold: float = 0.6
     davies_bouldin_threshold: float = 0.2
     source_acceptance_metric: str = 'sil'
     regularization_factor_eigvals: float = 0.5
@@ -116,12 +116,12 @@ class EmgDecompositionParams:
     improvement_iteration_metric: str = 'isi'
     firings_similarity_metric: str = 'perc_coincident'
     max_similarity: float = 0.3
-    min_n_peaks: int = 20
+    min_n_peaks: int = 5
     fraction_peaks_initialization: float = 0.75
     w_init_indices: Optional[np.ndarray] = None
     improvement_iteration_min_peak_heights: Optional[float] = None
-    waveform_duration_ms: float = 30.0
-    pre_spike_waveform_duration_ms: Optional[float] = 10.0
+    waveform_duration_ms: float = 5
+    pre_spike_waveform_duration_ms: Optional[float] = 5
     clustering_algorithm: str = 'kmeans'
     dask_chunk_size_samples: int = 100000
     sil_max_samples: int = -1

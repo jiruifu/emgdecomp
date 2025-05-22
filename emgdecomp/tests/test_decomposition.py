@@ -156,9 +156,11 @@ class TestEmgDecomposition(object):
                     deltas = impulses_indices[actual_sidx, :] - detected_peak
                     arg_min = np.argmin(np.abs(deltas))
                     nearests.append(deltas[arg_min])
-                mode, count = stats.mode(nearests)
-                closest_sidxs[actual_sidx] = mode[0]
-                percentage[actual_sidx] = 100.0 * count[0] / len(nearests)
+                mode_result = stats.mode(nearests)
+                mode = mode_result.mode if np.isscalar(mode_result.mode) else mode_result.mode[0]
+                count = mode_result.count if np.isscalar(mode_result.count) else mode_result.count[0]
+                closest_sidxs[actual_sidx] = mode
+                percentage[actual_sidx] = 100.0 * count / len(nearests)
             closest_sidx = np.argmax(percentage)
             identified[closest_sidx].add(sidx)
             percentages[sidx] = percentage[closest_sidx]

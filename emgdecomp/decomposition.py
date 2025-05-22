@@ -5,6 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from typing import Optional, Union, Dict, Tuple, List, Callable
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,16 @@ from emgdecomp._data import EmgDataManager
 from emgdecomp.parameters import EmgDecompositionParams
 from ._util import minimum_distances, find_disconnected_subgraphs
 
+# Configure logging to write to both file and console
+log_filename = f'emgdecomp_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()  # This will output to console
+    ]
+)
 
 @dataclass
 class Component:
@@ -63,6 +74,7 @@ class EmgDecompositionModel(object):
     """
     Holds data relevant to the decomposition model.
     """
+    extended_data_raw: np.ndarray
     extended_data_mean: np.ndarray
     whitening_matrix: np.ndarray
     components: Components
@@ -98,6 +110,8 @@ class EmgDecomposition(object):
         self._verbose = verbose
         self._use_cuda = use_cuda
         self._use_dask = use_dask
+        self.output_peaks = None
+        self.output_sources = None
 
         if use_dask:
             if use_cuda:
@@ -200,7 +214,7 @@ class EmgDecomposition(object):
         self._check_not_decomposed()
 
         # 1) Data preprocessing: extend, subtract mean, whiten
-        whitened_data = self._data_preprocessing(data)
+        whitened_data, extended_data = self._data_preprocessing(data)
 
         # 2) Define 'good' indices to initialize new sources (wi)
         # The scipy find peaks algorithm doesn't work on cp.arrays. An option would be to use scupy.
@@ -223,7 +237,7 @@ class EmgDecomposition(object):
         # 4) Postprocessing: (i) remove duplicated sources, (ii) sources capturing artifacts (rarely active),
         # (iii) get detected peaks (the timings of the detected MUAs), and the thresholds used to separate a source from
         # baseline activity.
-        return self._do_post_processing(whitened_data, original_data=data, old_thresholds=None, old_waveforms=None)
+        return self._do_post_processing(whitened_data, original_data=data, old_thresholds=None, old_waveforms=None, extended_data=extended_data)
 
     def decompose_batch(self, data: np.ndarray) -> np.ndarray:
         """
@@ -362,6 +376,7 @@ class EmgDecomposition(object):
         # Create the "extended" version of the data
         # extended_data = [xi(k), xi(k-1), ..., xi(k-extension_factor)], i = 1, n_channels
         extended_data = self._extend_data(data, num_channels, num_samples)
+        raw_extended_data = extended_data.copy()
 
         # Subtract mean from data
         if self._model is None:
@@ -397,6 +412,7 @@ class EmgDecomposition(object):
 
         if self._model is None:
             self._model = EmgDecompositionModel(
+                extended_data_raw=raw_extended_data,
                 extended_data_mean=extended_data_mean,
                 whitening_matrix=whitening_matrix,
                 components=Components(data=[])
@@ -406,7 +422,7 @@ class EmgDecomposition(object):
 
         ret = self._manager_factory(whitened_data)
         logging.info(f'Whitened data created. Array: {ret}')
-        return ret
+        return ret, extended_data
 
     def _extend_data(self, data: np.ndarray, num_channels: int, num_samples: int) -> np.ndarray:
         """
@@ -724,7 +740,7 @@ class EmgDecomposition(object):
                 indices, _ = find_peaks(np_gamma, height=t, distance=peak_distance)
                 if len(indices) <= 1:
                     continue
-                candidate_peaks = np.zeros(np_gamma.shape, dtype=np.bool)
+                candidate_peaks = np.zeros(np_gamma.shape, dtype=np.bool_)
                 candidate_peaks[indices] = True
                 isi = np.diff(indices)
                 cov = np.std(indices) / np.mean(indices)
@@ -750,7 +766,8 @@ class EmgDecomposition(object):
                             whitened_data: EmgDataManager,
                             original_data: np.ndarray,
                             old_thresholds: Optional[np.ndarray] = None,
-                            old_waveforms: Optional[Dict[int, np.ndarray]] = None) -> np.ndarray:
+                            old_waveforms: Optional[Dict[int, np.ndarray]] = None,
+                            extended_data: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Some artifacts can be detected as a source. To minimize the number of 'artifact' sources we extract here we
         remove all sources that are inactive, i.e. those that only fire a small number of times (as given by
@@ -770,14 +787,16 @@ class EmgDecomposition(object):
         n_sources = np.max(timings['source_idx']) + 1
         keep_first_n_sources = 0 if old_thresholds is None else len(old_thresholds)
         n_events = {}
+        total_removed = 0
         for source in range(n_sources):
             if source < keep_first_n_sources:
                 continue
             n_events[source] = sum(timings['source_idx'] == source)
             if n_events[source] < self.params.min_n_peaks:
                 logging.info(f'Source {source} was detected only {n_events[source]} times; removing it.')
+                total_removed += 1
                 timings = timings[np.flatnonzero(timings['source_idx'] != source)]
-
+        logging.info(f'Total units removed: {total_removed} out of {n_sources}')
         # Remove duplicates
         remaining_source_idxs, _ = remove_duplicates(
             spike_trains_source_indexes=timings['source_idx'],
@@ -790,6 +809,7 @@ class EmgDecomposition(object):
             return np.empty((0,), dtype=self._firings_dtype())
 
         deduped_sources = self._raw_sources[:, np.array(remaining_source_idxs)]
+        self.output_sources = deduped_sources
 
         timings = timings[np.isin(timings['source_idx'], remaining_source_idxs)]
         peaks = timings.copy()
@@ -810,7 +830,25 @@ class EmgDecomposition(object):
             for source_idx, waveform in old_waveforms.items():
                 mean_waveforms[source_idx] = waveform
         self._populate_results(deduped_sources, mean_waveforms, thresholds)
-        return peaks
+        self.output_peaks = peaks
+        self.MUST = timings
+        B = deduped_sources.T 
+        IPTs = B @ extended_data
+        IPTs = IPTs.T
+        IPTs = IPTs.astype(np.float64)
+        num_MUs = IPTs.shape[1]
+        MUIDs_list = [f"MU_{i}" for i in range(1,num_MUs+1)]
+        MUIDs = np.array(MUIDs_list, dtype=object)
+        
+        MUPulses = []
+        firings_df = pd.DataFrame(peaks)
+        unique_sources = firings_df['source_idx'].unique()
+        for source in unique_sources:
+            discharge_samples = firings_df[firings_df['source_idx'] == source]['discharge_samples'].astype(np.float64).tolist()
+            MUPulses.append(discharge_samples)
+        MUPulses = np.array(MUPulses, dtype="object")
+
+        return IPTs, MUIDs, MUPulses, thresholds
 
     def _detect_spikes(
             self,
@@ -842,10 +880,10 @@ class EmgDecomposition(object):
 
     def _firings_dtype(self):
         return np.dtype([
-            ('source_idx', np.int),
-            ('discharge_samples', np.int),
-            ('discharge_seconds', np.float),
-            ('squared_amplitude', np.float),
+            ('source_idx', np.int64),
+            ('discharge_samples', np.int64),
+            ('discharge_seconds', np.float64),
+            ('squared_amplitude', np.float64)
         ])
 
     def _populate_results(self, sources: np.ndarray, mean_waveforms: Dict[int, np.ndarray], thresholds: np.ndarray):
@@ -914,8 +952,8 @@ class EmgDecomposition(object):
                                                        self.params.extension_factor)]
 
                 waveforms = np.zeros((len(discharges), num_channels, wf_samples), dtype=np.float64)
-                aligned_channel_indices = np.empty((len(discharges),), dtype=np.int)
-                emg_data_indices = np.empty((len(discharges),), dtype=np.int)
+                aligned_channel_indices = np.empty((len(discharges),), dtype=np.int64)
+                emg_data_indices = np.empty((len(discharges),), dtype=np.int64)
                 num_discharges = 0
                 for discharge_idx, discharge in enumerate(discharges):
                     mask = np.arange(wf_samples) - wf_pre_offset + discharge + self.params.extension_factor
@@ -1004,8 +1042,9 @@ def compute_percentage_coincident(spike_train_1: np.ndarray, spike_train_2: np.n
     if len(spike_train_2) < len(spike_train_1):
         spike_train_1, spike_train_2 = spike_train_2, spike_train_1
     distances = minimum_distances(spike_train_1, spike_train_2)
-    mode, _ = stats.mode(distances)
-    mode = mode[0]
+    mode_result = stats.mode(distances)
+    # Handle both scalar and array mode results
+    mode = mode_result.mode if np.isscalar(mode_result.mode) else mode_result.mode[0]
     counts = np.sum((distances == mode) | (distances == mode + 1) | (distances == mode - 1))
     return counts / max(len(spike_train_1), len(spike_train_2))
 
@@ -1015,8 +1054,9 @@ def compute_rate_of_agreement(spike_train_1: np.ndarray, spike_train_2: np.ndarr
     if len(spike_train_1) > len(spike_train_2):
         spike_train_1, spike_train_2 = spike_train_2, spike_train_1
     distances = minimum_distances(spike_train_1, spike_train_2)
-    mode, _ = stats.mode(distances)
-    mode = mode[0]
+    mode_result = stats.mode(distances)
+    # Handle both scalar and array mode results
+    mode = mode_result.mode if np.isscalar(mode_result.mode) else mode_result.mode[0]
     n_common = np.sum((distances == mode) | (distances == mode + 1) | (distances == mode - 1))
     roa = 100 * n_common / (len(spike_train_1) + len(spike_train_2) - n_common)
     return roa

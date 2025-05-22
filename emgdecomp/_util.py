@@ -24,7 +24,7 @@ def minimum_distances(
     right_arr = np.array(right_arr)
 
     ret = np.empty((len(left_arr),), dtype=left_arr.dtype)
-    ret_indices = np.empty((len(left_arr)), dtype=np.int)
+    ret_indices = np.empty((len(left_arr)), dtype=np.int64)
     unsorted_ret = np.empty(ret.shape, dtype=ret.dtype)
     unsorted_ret_indices = np.empty(ret_indices.shape, dtype=ret_indices.dtype)
     _minimum_distances_jit(
